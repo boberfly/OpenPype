@@ -26,11 +26,12 @@ class ReportingAnimatorsServer(ServerAction):
     event_reporting_statuses = None
     events_span_hours = None
     limit_span_to_midnight = None
+    event_retake_statuses = None
 
     # defaults
     __users = None
     __statuses = None
-    query_limit = 5
+    query_limit = None
 
     def discover(self, session, entities, event):
         """Show only on project."""
@@ -56,50 +57,23 @@ class ReportingAnimatorsServer(ServerAction):
         # define start time
         start_time = end_time.shift(hours=-self.events_span_hours)
 
-        self.log.debug(
-            "__  task_types: {}".format(
-                self.task_types))
-
         # get all taskType id which are 'Animation'
         task_type_ids = self._get_tasks_type_ids(
             self.task_types)
-
-        self.log.info(
-            "__  task_type_ids: {}".format(
-                task_type_ids))
-
-        self.log.debug(
-            "__  event_reporting_statuses: {}".format(
-                self.event_reporting_statuses))
 
         # get all Statuses ids with name `Approved` and `Supervisor Review`
         status_id_filter = self._get_statuses(
             self.event_reporting_statuses
         )
 
-        self.log.debug(
-            "__  status_id_filter: {}".format(
-                status_id_filter))
-
         # get all tasks which are having change statuse within time range
         # and are defined task types members
         tasks = self._get_tasks(
             task_type_ids, status_id_filter, start_time, end_time)
 
-        self.log.info("__  tasks: {}".format(pformat(tasks)))
-        self.log.info("_" * 100)
-
         user_report_data = self._generate_report_data(tasks)
 
-        self.log.info("__  user_report_data: {}".format(
-            pformat(user_report_data)))
-        self.log.info("_" * 100)
-
         self.create_xlsx_report(user_report_data)
-
-        # get all Users with membership in `Animators` group
-        self.log.info("__  self.users: {}".format(
-            self.users))
 
         return True
 
@@ -120,7 +94,7 @@ class ReportingAnimatorsServer(ServerAction):
             user_data = []
             for _id, attrs in tasks_data.items():
                 status = attrs["status_changes"]
-                if _uid == status["user_id"]:
+                if _uid == attrs["user_id"]:
                     _data = deepcopy(data)
                     _data.update({
                         "task": attrs["task_name"],
@@ -166,36 +140,28 @@ class ReportingAnimatorsServer(ServerAction):
             return_statuses["reporting"] = {
                 "user_id": event["user_id"],
                 "status_id": status_id,
-                "status_name": status_ids[status_id]["name"]
+                "status_name": status_ids[status_id]["name"],
+                "parent_id": event["parent_id"]
 
             }
-            self.log.info(f"__ correct status id: `{event['status_id']}`")
 
         return return_statuses
 
     def _get_tasks(self, task_type_ids, status_ids, time_from, time_to):
-
-        self.log.info(task_type_ids)
-
+        users = self.users
         task_type_ids_str = self.join_query_keys(task_type_ids.keys())
-
-        self.log.info(">> task_type_ids_str: `{}`".format(
-            task_type_ids_str))
-
+        user_ids_str = self.join_query_keys(users.keys())
         # get Tasks
         _query = str(
-            'select id, name, type_id, parent_id '
+            'select id, name, type_id, parent_id, assignments '
             f'from Task where project_id is "{self._project_id}" '
             f'and type_id in ({task_type_ids_str}) '
+            f'and assignments any ( resource_id in ({user_ids_str})) '
             f'and status_changes any ( date <= "{time_to}" '
             f'and date >= "{time_from}") '
-            # here could be filter by user ids list
         )
-        self.log.info(">> _query: `{}`".format(_query))
         tasks = self._query_from_session(_query)
-
-        self.log.info(">> Query found Tasks - count: `{}`".format(
-            len(tasks)))
+        self.log.info(f"Task amount: `{len(tasks)}`")
 
         # filter out all tasks which are not in selected entity as parent
         tasks_filtred = {}
@@ -212,13 +178,29 @@ class ReportingAnimatorsServer(ServerAction):
                 task["status_changes"], status_ids, time_from, time_to
             )
 
-            self.log.info(
-                f"__ filter_status_changes: `{filter_status_changes}`")
+            assigned_user_id = self._assigned_user(task)
+
+            self.log.info(f"Task: `{task}`")
 
             shot_data = self._get_shot_data(task["parent_id"])
 
+            self.log.info(f"filter_status_changes: `{filter_status_changes}`")
+
+            if not shot_data:
+                continue
+
+            if not filter_status_changes.get("reporting"):
+                continue
+
+            users = self.users
+            user_name = users[assigned_user_id]["name"]
+            self.log.info(
+                f"Adding Task: {shot_data['name']}:{task['name']}>{user_name}")
+
             tasks_filtred.update({
                 task["id"]: {
+                    "user_name": user_name,
+                    "user_id": assigned_user_id,
                     "parent_id": task["parent_id"],
                     "shot_name": shot_data["name"],
                     "seconds": shot_data["seconds"],
@@ -227,7 +209,8 @@ class ReportingAnimatorsServer(ServerAction):
                     "status_changes": filter_status_changes["reporting"],
                     "repair_cycles": len([
                         _st for _st in  filter_status_changes["all_names"]
-                        if _st.lower() in ["change requested"]])
+                        if _st.lower() in [
+                            _s.lower() for _s in self.event_retake_statuses]])
                 }
             })
 
@@ -239,11 +222,14 @@ class ReportingAnimatorsServer(ServerAction):
             'from Shot where id is "{}"').format(parent_id)
         query_output = self._session.query(_query).first()
 
-        _cuattr = query_output["custom_attributes"]
-        self.log.info(query_output["name"])
-        self.log.info({k: v for k, v in _cuattr.items()})
+        if not query_output:
+            return None
 
-        frame_start = int(_cuattr["frameStart"])
+        self.log.info(f"Parent Shot entity: `{query_output['name']}`")
+
+        _cuattr = query_output["custom_attributes"]
+
+        frame_start = int(_cuattr.get("frameStart") or 1001)
         frame_end = int(_cuattr["frameEnd"])
         fps = float(_cuattr.get("fps") or 25)
 
@@ -288,8 +274,6 @@ class ReportingAnimatorsServer(ServerAction):
         if names_str:
             _query += ' where name in ({})'.format(names_str)
 
-        self.log.info('__> _query: `{}`'.format(_query))
-
         returned_entities = self._query_from_session(_query)
 
         if ouptup_attrs and isinstance(ouptup_attrs, (list, tuple)):
@@ -315,6 +299,9 @@ class ReportingAnimatorsServer(ServerAction):
     def _query_from_session(self, _query, use_limit=True):
         if self.query_limit and use_limit:
             _query += ' limit {}'.format(self.query_limit)
+
+        self.log.info(f"Query used: `{_query}`")
+
         return self._session.query(_query).all()
 
     def _get_users(self):
@@ -332,10 +319,7 @@ class ReportingAnimatorsServer(ServerAction):
         if group_ids:
             _query += f' where memberships any (group_id in ({group_ids_str}))'
 
-        users = self._query_from_session(_query)
-
-        self.log.info(">> Collected Users - count: `{}`".format(
-            len(users)))
+        users = self._query_from_session(_query, use_limit=False)
 
         return {
             user["id"]: {
@@ -343,6 +327,9 @@ class ReportingAnimatorsServer(ServerAction):
                 "username": user["username"]
             } for user in users
         }
+
+    def _assigned_user(self, task):
+        return task["assignments"].pop()["resource_id"]
 
     @property
     def users(self):
