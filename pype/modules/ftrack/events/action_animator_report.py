@@ -14,6 +14,35 @@ class ReportingAnimatorsServer(ServerAction):
 
     required modules installation:
         `python -m pip install pandas, openpyxl, xlsxwriter`
+
+    Add following to config `presets\ftrack\plugins\server.json`
+    ```
+    {
+        "ReportingAnimatorsServer": {
+            "role_list": [
+                "pypeclub",
+                "administrator",
+                "project manager"
+            ],
+            "task_types": [
+                "Animation"
+            ],
+            "user_group_membership": [
+                "Animation Team 1",
+                "Animation Team 2"
+            ],
+            "event_reporting_statuses": [
+                "Approved",
+                "Lead Review"
+            ],
+            "event_retake_statuses": [
+                "Retake"
+            ],
+            "events_span_hours": 24,
+            "limit_span_to_midnight": true
+        }
+    }
+    ```
     """
 
     identifier = "report.generator.animator"
