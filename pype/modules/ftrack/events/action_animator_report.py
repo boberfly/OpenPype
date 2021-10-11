@@ -1,9 +1,11 @@
+import os
+import tempfile
 from copy import deepcopy
 from pprint import pformat
 import arrow
 import pandas as pd
 from pathlib import Path
-
+import json
 from pype.modules.ftrack import ServerAction
 
 
@@ -14,13 +16,12 @@ class ReportingAnimatorsServer(ServerAction):
         `python -m pip install pandas, openpyxl, xlsxwriter`
     """
 
-    identifier = "report.animator"
-    label = "Reporting Animators (Server)"
+    identifier = "report.generator.animator"
+    label = "Reporting Animators"
     description = "Get Animator's report S/24"
 
     # presets
     role_list = ["Pypeclub", "Administrator", "Project Manager"]
-    report_path = None
     task_types = None
     user_group_membership = None
     event_reporting_statuses = None
@@ -42,6 +43,86 @@ class ReportingAnimatorsServer(ServerAction):
 
     def launch(self, session, entities, event):
 
+        user_entity = session.query(
+            "User where id is {}".format(event["source"]["user"]["id"])
+        ).one()
+        job_entity = session.create("Job", {
+            "user": user_entity,
+            "status": "running",
+            "data": json.dumps({
+                "description": "Animation Report Generator running..."
+            })
+        })
+        session.commit()
+
+        try:
+            result = self.action_process(job_entity, session, entities, event)
+        except Exception as _E:
+            msg = "Animation Report Generator failed: {}".format(_E)
+
+            self.log.error(msg, exc_info=True)
+
+            result = {
+                "success": False,
+                "message": msg
+            }
+            job_entity["data"] = json.dumps({
+                "description": msg
+            })
+            job_entity["status"] = "failed"
+            session.commit()
+
+        return result
+
+    def add_file_to_job(self, job_entity, session, description, file_path):
+
+        self.log.info("file_path: `{}`".format(file_path))
+
+        job_entity["data"] = json.dumps({
+            "description": description
+        })
+
+        job_entity["status"] = "done"
+
+
+        component_name = "{}_{}".format(
+            "AnimationReport_XLSX_file",
+            self.date_stamp
+        )
+
+        session._configure_locations()
+        self.log.info("component_name: `{}`".format(component_name))
+
+        # Query `ftrack.server` location where component will be stored
+        location = session.query(
+            "Location where name is \"ftrack.server\""
+        ).one()
+        self.log.info("location: `{}`".format(location))
+
+        # session.commit()
+
+
+        component = session.create_component(
+            file_path,
+            data={"name": component_name},
+            location=location
+        )
+        self.log.info("Component ID: `{}`".format(component["id"]))
+        session.create(
+            "JobComponent",
+            {
+                "component_id": component["id"],
+                "job_id": job_entity["id"]
+            }
+        )
+        session.commit()
+
+        # Delete temp file
+        os.remove(file_path)
+
+
+    def action_process(self, job_entity, session, entities, event):
+
         self._session = session
         self.selected_entity = entities[0]
         self._project_id = self.selected_entity["project_id"]
@@ -54,68 +135,123 @@ class ReportingAnimatorsServer(ServerAction):
         if self.limit_span_to_midnight:
             end_time = end_time.floor('day')
 
+        self.date_stamp = end_time.format('YYYY-MM-DD_HH-mm')
+
         # define start time
         start_time = end_time.shift(hours=-self.events_span_hours)
 
-        # get all taskType id which are 'Animation'
+        # get all taskType id for defined types
         task_type_ids = self._get_tasks_type_ids(
             self.task_types)
 
-        # get all Statuses ids with name `Approved` and `Supervisor Review`
+        # get all Statuses ids with name defined names
         status_id_filter = self._get_statuses(
             self.event_reporting_statuses
         )
 
+        # get all users which are in group Animators with assigned tasks
         # get all tasks which are having change statuse within time range
         # and are defined task types members
         tasks = self._get_tasks(
             task_type_ids, status_id_filter, start_time, end_time)
 
-        user_report_data = self._generate_report_data(tasks)
+        report_data = self._generate_report_data(tasks)
 
-        self.create_xlsx_report(user_report_data)
+        file_name_path = self.create_xlsx_report(report_data)
 
-        return True
+        self.add_file_to_job(
+            job_entity, session,
+            "Download Animation Report file here",
+            file_name_path
+        )
+
+        return {
+                "success": True,
+                "message": "Animation Reporting Finished"
+            }
 
     def _generate_report_data(self, tasks_data):
-
+        group_statuses = []
         report_data = []
         for _uid, uattrs in self.users.items():
-            data = {
-                "user": uattrs["name"],
+            user_name = uattrs["name"]
+            group = uattrs["group_name"]
+            empty_data = {
+                "user": "",
+                "shot": None,
                 "task": None,
                 "status": None,
-                "shot": None,
-                "seconds": 0,
-                "retakes": 0,
-                "retake seconds": 0
+                "seconds": None,
+                "retakes": None,
+                "retake seconds": None,
+                "group": None
             }
+
+            # user with no activity basic data
+            data = deepcopy(empty_data)
+            data["user"] = user_name
+            data["group"] = group
 
             user_data = []
             for _id, attrs in tasks_data.items():
-                status = attrs["status_changes"]
                 if _uid == attrs["user_id"]:
-                    _data = deepcopy(data)
+                    _data = deepcopy(empty_data)
                     _data.update({
-                        "task": attrs["task_name"],
-                        "status": status["status_name"],
+                        "user": "--",
                         "shot": attrs["shot_name"],
-                        "seconds": attrs["seconds"]
+                        "task": attrs["task_name"],
+                        "status": attrs["status_name"]
                     })
-                    if attrs["repair_cycles"]:
+                    if not attrs["wip"]:
+                        # add following only if it is not work in progress
                         _data.update({
-                            "retakes": 1,
-                            "retake seconds": attrs["seconds"]
-                        })
+                            "seconds": attrs["seconds"]})
+                        if attrs["repair_cycles"]:
+                            _data.update({
+                                "retakes": 1,
+                                "retake seconds": attrs["seconds"]
+                            })
 
                     user_data.append(_data)
 
             if user_data:
+                header_data = self.make_user_header_info(user_data)
+                # update header data with user name and remove status
+                header_data.update({
+                    "user": user_name,
+                    "status": "",
+                    "group": group
+                })
+                # add header sumary row
+                report_data.append(header_data)
+                group_statuses.append(header_data)
+                # add full list of task data
                 report_data += user_data
             else:
                 report_data.append(data)
 
-        return report_data
+            # add space
+            report_data.append(empty_data)
+
+        return report_data, group_statuses
+
+    def make_user_header_info(self, user_report_data):
+        df = pd.DataFrame(user_report_data)
+
+        # test print
+        self.log.info(df.to_string())
+
+        df_sums = df.groupby(
+            ['user'], as_index=False).agg({
+                'shot': 'count',
+                "task": 'count',
+                'status': 'last',
+                'seconds': 'sum',
+                'retakes': 'sum',
+                'retake seconds': 'sum'
+            })
+
+        return df_sums.to_dict('records').pop()
 
     def _get_status_changes(self, events, status_ids, time_from, time_to):
 
@@ -123,8 +259,14 @@ class ReportingAnimatorsServer(ServerAction):
             "reporting": None,
             "all_names": []
         }
-        for event in events:
-            date = arrow.get(event["date"])
+
+        # first of all sort events by dates
+        _events = {event["date"]: event for event in events}
+        _sorted_events_dates = sorted(_events.keys())
+        # then iterate all events
+        for _date in _sorted_events_dates:
+            date = arrow.get(_date)
+            event = _events[_date]
             status_id = event["status_id"]
 
             if (date > time_to and date < time_from):
@@ -189,8 +331,14 @@ class ReportingAnimatorsServer(ServerAction):
             if not shot_data:
                 continue
 
-            if not filter_status_changes.get("reporting"):
-                continue
+            # if reporting status is available add it or add last used status
+            # also define if the task is in progress or in review
+            if filter_status_changes.get("reporting"):
+                status_name = filter_status_changes["reporting"]["status_name"]
+                wip = False
+            else:
+                wip = True
+                status_name = filter_status_changes["all_names"][-1]
 
             users = self.users
             user_name = users[assigned_user_id]["name"]
@@ -199,6 +347,7 @@ class ReportingAnimatorsServer(ServerAction):
 
             tasks_filtred.update({
                 task["id"]: {
+                    "wip": wip,
                     "user_name": user_name,
                     "user_id": assigned_user_id,
                     "parent_id": task["parent_id"],
@@ -206,7 +355,7 @@ class ReportingAnimatorsServer(ServerAction):
                     "seconds": shot_data["seconds"],
                     "task_type": task_type_ids[task["type_id"]]["name"],
                     "task_name": task["name"],
-                    "status_changes": filter_status_changes["reporting"],
+                    "status_name": status_name,
                     "repair_cycles": len([
                         _st for _st in  filter_status_changes["all_names"]
                         if _st.lower() in [
@@ -306,30 +455,30 @@ class ReportingAnimatorsServer(ServerAction):
 
     def _get_users(self):
 
+        _users = {}
+
         # get all Users
-        _query = str(
+        _query_base = str(
             'select id, username, last_name, first_name, is_active from User')
 
-        # get group ids of filtered group names
-        group_ids = self._get_group_ids(
-            self.user_group_membership
-        )
-        group_ids_str = self.join_query_keys(group_ids.keys())
+        groups = self._get_group_ids(self.user_group_membership)
+        for group_id in groups:
+            _query = (_query_base
+                      + f' where memberships any (group_id is {group_id})')
 
-        if group_ids:
-            _query += f' where memberships any (group_id in ({group_ids_str}))'
+            users = self._query_from_session(_query, use_limit=False)
 
-        users = self._query_from_session(_query, use_limit=False)
-
-        return {
-            user["id"]: {
-                "name": "{} {}".format(user["first_name"], user["last_name"]),
-                "username": user["username"]
-            } for user in users
-        }
+            _users.update({
+                user["id"]: {
+                    "group_name": groups[group_id]["name"],
+                    "name": "{} {}".format(user["first_name"], user["last_name"]),
+                    "username": user["username"]
+                } for user in users if user["is_active"]
+            })
+        return _users
 
     def _assigned_user(self, task):
-        return task["assignments"].pop()["resource_id"]
+        return task["assignments"][-1]["resource_id"]
 
     @property
     def users(self):
@@ -357,44 +506,53 @@ class ReportingAnimatorsServer(ServerAction):
             self.__statuses = self._get_all_statuses()
         return self.__statuses
 
-    def create_xlsx_report(self, user_report_data):
-        def multiple_dfs(df_list, sheets, file_name, spaces):
-            _report_path = Path(self.report_path)
-            file_name_path = _report_path.joinpath(file_name)
+    def create_xlsx_report(self, report_data):
+        def multiple_dfs(df_list, sheet_name, spaces, horisontal=False):
+            # Create temp file where traceback will be stored
+            temp_obj = tempfile.NamedTemporaryFile(
+                mode="w", prefix=("pype_task_report_" + self.date_stamp + "_"),
+                suffix=".xlsx", delete=False
+            )
+            temp_obj.close()
+            file_name_path = temp_obj.name
             writer = pd.ExcelWriter(file_name_path, engine='xlsxwriter')
             row = 0
+            column = 0
             for dataframe in df_list:
-                dataframe.to_excel(writer, sheet_name=sheets,
-                                   startrow=row, startcol=0, index=False)
-                row = row + len(dataframe.index) + spaces + 1
+                dataframe.to_excel(writer, sheet_name=sheet_name,
+                                   startrow=row, startcol=column, index=False)
+                if horisontal:
+                    column = column + len(dataframe.columns) + spaces + 1
+                else:
+                    row = row + len(dataframe.index) + spaces + 1
             writer.save()
 
-        df = pd.DataFrame(user_report_data)
+            return file_name_path
+
+        user_report_data, group_data = report_data
+        df_users = pd.DataFrame(user_report_data)
+        df_groups = pd.DataFrame(group_data)
 
         # test print
-        self.log.info(df.to_string())
+        self.log.info(df_users.to_string())
+        self.log.info(df_groups.to_string())
 
-        df_sums = df.groupby(
-            ['user'], as_index=False).agg({
-                'shot': 'count',
-                'seconds': 'sum',
-                'retakes': 'sum',
-                'retake seconds': 'sum'
-            })
-
-        df_tasks = df.groupby(
-            ['user', 'shot'], as_index=False).agg({
-                'status': 'first',
+        # get group data statistics
+        df_groups_grouped = df_groups.groupby(
+            ['group'], as_index=False).agg({
+                'user': 'count',
+                'shot': 'sum',
                 'seconds': 'sum',
                 'retakes': 'sum',
                 'retake seconds': 'sum'
             })
 
         # list of dataframes
-        dfs = [df_sums, df_tasks]
+        dfs = [df_users, df_groups_grouped]
 
         # run function
-        multiple_dfs(dfs, "report_day", "animation_seconds_report.xlsx", 2)
+        return multiple_dfs(
+            dfs, "report_day", 2, True)
 
 def register(session, plugins_presets):
     '''Register plugin. Called when used as an plugin.'''
