@@ -1,5 +1,7 @@
 import os
+import sys
 import tempfile
+import traceback
 from copy import deepcopy
 from pprint import pformat
 import arrow
@@ -26,7 +28,7 @@ class ReportingAnimatorsServer(ServerAction):
             ],
             "task_types": [
                 "Animation"
-            ],
+            ]
             "user_group_membership": [
                 "Animation Team 1",
                 "Animation Team 2"
@@ -86,36 +88,46 @@ class ReportingAnimatorsServer(ServerAction):
 
         try:
             result = self.action_process(job_entity, session, entities, event)
-        except Exception as _E:
-            msg = "Animation Report Generator failed: {}".format(_E)
-
+        except Exception:
+            msg = "Animation Report failed: download report from JOB"
             self.log.error(msg, exc_info=True)
 
-            result = {
-                "success": False,
-                "message": msg
-            }
-            job_entity["data"] = json.dumps({
-                "description": msg
-            })
-            job_entity["status"] = "failed"
-            session.commit()
+            self.add_file_to_job(
+                job_entity, session,
+                "Download Crash Report"
+            )
 
         return result
 
-    def add_file_to_job(self, job_entity, session, description, file_path):
-
-        self.log.info("file_path: `{}`".format(file_path))
-
+    def add_file_to_job(self, job_entity, session, description, file_path=None):
+        _comonent_name = "AnimationReport_XLSX_file"
         job_entity["data"] = json.dumps({
             "description": description
         })
-
         job_entity["status"] = "done"
+
+        if not file_path:
+            # Create temp file where traceback will be stored
+            temp_obj = tempfile.NamedTemporaryFile(
+                mode="w", prefix="pype_ftrack_", suffix=".txt", delete=False
+            )
+            temp_obj.close()
+            temp_filepath = temp_obj.name
+
+            # Store traceback to file
+            result = traceback.format_exception(*sys.exc_info())
+            with open(temp_filepath, "w") as temp_file:
+                temp_file.write("".join(result))
+
+            _comonent_name = "AnimationReport_traceback_file"
+            file_path = temp_filepath
+            job_entity["status"] = "failed"
+
+        self.log.info("file_path: `{}`".format(file_path))
 
 
         component_name = "{}_{}".format(
-            "AnimationReport_XLSX_file",
+            _comonent_name,
             self.date_stamp
         )
 
@@ -127,9 +139,6 @@ class ReportingAnimatorsServer(ServerAction):
             "Location where name is \"ftrack.server\""
         ).one()
         self.log.info("location: `{}`".format(location))
-
-        # session.commit()
-
 
         component = session.create_component(
             file_path,
@@ -370,6 +379,10 @@ class ReportingAnimatorsServer(ServerAction):
                 status_name = filter_status_changes["all_names"][-1]
 
             users = self.users
+
+            if not users.get(assigned_user_id):
+                continue
+
             user_name = users[assigned_user_id]["name"]
             self.log.info(
                 f"Adding Task: {shot_data['name']}:{task['name']}>{user_name}")
